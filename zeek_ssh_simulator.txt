@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# 01. Define the variables
+SCENARIO="brute_force_ssh"
+IFACE="ens33"                    # CHANGE THIS: Use 'ip addr' to find your actual interface
+UBUNTU_IP="192.168.1.157"        # Your Ubuntu IP
+KALI_USER="kali"                 # SSH user on Kali
+KALI_IP="192.168.1.154"          # Your Kali IP
+TEST_USER="jdoe"                 # User to attack on Ubuntu
+REPO_PATH="/home/evanswj/ZeekAttackMonitor"
+TEMP_DIR=$(mktemp -d)
+
+cleanup() {
+    echo "Cleaning up ..."
+    [[ -n "$ZEEK_PID" ]] && sudo kill "$ZEEK_PID" 2>/dev/null
+    rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
+
+# 02. Start Zeek with Brute-Force Detection Policy
+echo "Starting Zeek on $IFACE with SSH detection ..."
+cd "$TEMP_DIR" || exit 1
+# 'local' loads site-specific scripts; we add the specific SSH policy, here
+sudo /opt/zeek/bin/zeek -i "$IFACE" protocols/ssh/detect-bruteforcing.zeek local &
+ZEEK_PID=$!
+sleep 5
+
+# 03. Run the attack (Triggers Kali remotely)
+echo "Triggering Hydra from Kali ..."
+# This requires SSH keys to be set up between Ubuntu and Kali
+ssh "$KALI_USER@$KALI_IP" "hydra -l $TEST_USER -P /usr/share/wordlists/rockyou.txt ssh://$UBUNTU_IP -t 4"
+
+# 04. Stop Zeek, and flush logs
+echo "Stopping capture ..."
+sudo kill "$ZEEK_PID"
+wait "$ZEEK_PID" 2>/dev/null
+
+# 05. Process logs (Including notice.log for alerts)
+echo "Processing logs ..."
+# Extract general connection data
+[ -f "conn.log" ] && sudo /opt/zeek/bin/zeek-cut ts id.orig_h id.resp_h service < conn.log > "$REPO_PATH/${SCENARIO}_conn.txt"
+
+# Extract SSH-specific failure data
+[ -f "ssh.log" ] && sudo /opt/zeek/bin/zeek-cut ts id.orig_h auth_success auth_attempts < ssh.log > "$REPO_PATH/${SCENARIO}_ssh.txt"
+
+# Extract actual Brute-Force alerts
+if [ -f "notice.log" ]; then
+    sudo /opt/zeek/bin/zeek-cut ts note msg < notice.log > "$REPO_PATH/${SCENARIO}_alerts.txt"
+    echo "Alerts detected and logged!"
+fi
+
+# 06. Push to GitHub
+cd "$REPO_PATH" || exit 1
+if [[ -n $(git status --porcelain) ]]; then
+    git add .
+    git commit -m "Brute force simulation - $(date)"
+    git push origin main
+else
+    echo "No new logs to push."
+fi
